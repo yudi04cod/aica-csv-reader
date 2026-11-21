@@ -15,17 +15,18 @@
 // each error {code, line, row} in the order met, line the 1-based line its
 // record starts on, row its index in rows (null for the header).
 //
-// Speed comes from never walking a plain field a character at a time. An
-// unquoted field is cut out with one indexOf(',') against a cached next
-// newline (the cache stays sound: past a field start, the next LF is the
-// record's end unless a comma comes first, since any later quoted field is
-// past a comma), and a quoted field jumps from quote to quote with
-// indexOf('"'), converting only the rare segment that holds a line break.
-// The character loop only runs for fields that actually hold a stray CR, junk
-// after a closing quote, or a quote that never closes. nextCR / nextLF are
-// refreshed lazily as pos moves forward, so their scans cover the text once
-// between them; both are invalidated on the one backward jump (an
-// unterminated quote resetting pos).
+// Speed comes from never walking a plain field a character at a time. A
+// record with no quote and no stray CR is cut out whole, one split(',') over
+// the line instead of a field at a time; an unquoted field is otherwise cut
+// out with one indexOf(',') against a cached next newline (the cache stays
+// sound: past a field start, the next LF is the record's end unless a comma
+// comes first, since any later quoted field is past a comma), and a quoted
+// field jumps from quote to quote with indexOf('"'), converting only the rare
+// segment that holds a line break. The character loop only runs for fields
+// that actually hold a stray CR, junk after a closing quote, or a quote that
+// never closes. nextCR / nextLF / nextQ are refreshed lazily as pos moves
+// forward, so their scans cover the text once between them; all three are
+// invalidated on the one backward jump (an unterminated quote resetting pos).
 
 /** How a field ended: 0 at a comma, 1 at a line break, 2 at the end of the text. */
 
@@ -42,11 +43,13 @@ export function run(input) {
   let line = 1; // the line that character is on
   if (text.charCodeAt(0) === 0xFEFF) pos = 1;
 
-  // The next CR / LF at or after pos (Infinity when none is left).
+  // The next CR / LF / quote at or after pos (Infinity when none is left).
   let nextCR = text.indexOf('\r', pos);
   if (nextCR === -1) nextCR = Infinity;
   let nextLF = text.indexOf('\n', pos);
   if (nextLF === -1) nextLF = Infinity;
+  let nextQ = text.indexOf('"', pos);
+  if (nextQ === -1) nextQ = Infinity;
 
   // The record being read: the line it starts on, and its index in rows
   // (null while the header is still unread).
@@ -89,10 +92,37 @@ export function run(input) {
 
     recordLine = line;
     recordRow = header && columns === null ? null : rows.length;
-    const fields = [];
+    let fields;
     let quoted = false;
     let ended = 0;
 
+    // A record with no quote and no stray CR is cut out whole: one split(',')
+    // over the line instead of a field at a time. The line end is the cached
+    // next LF (a quote before it, or a CR that is not the CRLF's own, sends
+    // the record to the field loop below).
+    if (nextLF < pos) { nextLF = text.indexOf('\n', pos); if (nextLF === -1) nextLF = Infinity; }
+    if (nextCR < pos) { nextCR = text.indexOf('\r', pos); if (nextCR === -1) nextCR = Infinity; }
+    if (nextQ < pos) { nextQ = text.indexOf('"', pos); if (nextQ === -1) nextQ = Infinity; }
+    const le = nextLF;
+    const noQuote = le === Infinity ? nextQ === Infinity : nextQ > le;
+    if (noQuote && (nextCR >= le || nextCR === le - 1)) {
+      if (le === Infinity) {
+        fields = text.slice(pos, n).split(',');
+        pos = n;
+        ended = 2;
+      } else if (nextCR === le - 1) {
+        fields = text.slice(pos, le - 1).split(','); // CRLF
+        pos = le + 1;
+        line += 1;
+        ended = 1;
+      } else {
+        fields = text.slice(pos, le).split(',');
+        pos = le + 1;
+        line += 1;
+        ended = 1;
+      }
+    } else {
+      fields = [];
     do {
       if (text.charCodeAt(pos) === 34) {
         // A field that opens with a quote.
@@ -111,8 +141,9 @@ export function run(input) {
             // where the quote opened, as the reference rewinds it).
             pos = open + 1;
             line = openLine;
-            nextCR = -1; // pos moved back: both caches must be re-found
+            nextCR = -1; // pos moved back: all three caches must be re-found
             nextLF = -1;
+            nextQ = -1;
             errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
             const r = unquotedSlow('"');
             value = r.v;
@@ -221,6 +252,7 @@ export function run(input) {
         }
       }
     } while (ended === 0);
+    }
 
     // A line that held only stray CRs is left with no characters: no record
     // (its stray_cr errors stay).
